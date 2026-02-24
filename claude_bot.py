@@ -1,25 +1,40 @@
 #!/usr/bin/env python3
-"""LXMF AI Bot — bridges LXMF messages to a local LLM via Ollama."""
+"""LXMF AI Bot — bridges LXMF messages to an LLM (Claude CLI, Anthropic API, or OpenAI-compatible)."""
 
+import json
 import os
-import sys
+import shutil
 import signal
+import subprocess
+import sys
 import time
 import threading
 from pathlib import Path
 
 import RNS
 import LXMF
-from openai import OpenAI
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 DATA_DIR = Path.home() / ".lxmf-claude"
 IDENTITY_PATH = DATA_DIR / "identity"
 STORAGE_PATH = DATA_DIR / "storage"
 
-MAX_HISTORY = 10        # message pairs per sender
+MAX_HISTORY = 10        # message pairs per sender (API backends only)
 MAX_RESPONSE_CHARS = 1500
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
-MODEL = "glm-5:cloud"
+OLLAMA_MODEL = "glm-5:cloud"
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+CLI_MODEL = "haiku"
+CLI_TIMEOUT = 120       # seconds per CLI invocation
 DISPLAY_NAME = "AI Bot"
 
 SYSTEM_PROMPT = (
@@ -28,11 +43,16 @@ SYSTEM_PROMPT = (
     "If a topic needs a longer answer, give a brief summary and offer to elaborate."
 )
 
-# Conversation history per sender, keyed by sender hash (hex)
-conversations: dict[str, list[dict]] = {}
+# Per-sender state
+conversations: dict[str, list[dict]] = {}      # API backends: message history
 conversations_lock = threading.Lock()
+cli_sessions: dict[str, str] = {}              # CLI backend: sender_hash -> session_id
+cli_sessions_lock = threading.Lock()
 
-llm_client: OpenAI = None
+# Set at startup based on available backend
+backend: str = None       # "claude-cli", "anthropic", or "openai"
+llm_client = None         # anthropic.Anthropic or OpenAI instance (API backends)
+model: str = None
 lxm_router: LXMF.LXMRouter = None
 delivery_destination: RNS.Destination = None
 shutdown_event = threading.Event()
@@ -53,38 +73,123 @@ def get_or_create_identity() -> RNS.Identity:
     return identity
 
 
+def _run_claude_cli(sender_hash: str, user_message: str) -> str:
+    """Call claude -p, resuming an existing session if one exists for this sender."""
+    stripped = user_message.strip()
+
+    # Handle /clear locally
+    if stripped.lower() in ("/clear", "/reset"):
+        with cli_sessions_lock:
+            cli_sessions.pop(sender_hash, None)
+        return "Conversation cleared."
+
+    with cli_sessions_lock:
+        session_id = cli_sessions.get(sender_hash)
+
+    # Build command: resume existing session, or start new one
+    cmd = ["claude", "-p", "--output-format", "json", "--model", CLI_MODEL]
+    if session_id:
+        cmd.extend(["--resume", session_id])
+    else:
+        cmd.extend(["--system-prompt", SYSTEM_PROMPT])
+
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    env.pop("ANTHROPIC_API_KEY", None)
+
+    result = subprocess.run(
+        cmd,
+        input=user_message,
+        capture_output=True,
+        text=True,
+        timeout=CLI_TIMEOUT,
+        env=env,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"Exit code {result.returncode}")
+
+    data = json.loads(result.stdout)
+
+    # Store session ID for future resume
+    with cli_sessions_lock:
+        cli_sessions[sender_hash] = data["session_id"]
+
+    return data["result"]
+
+
 def get_llm_response(sender_hash: str, user_message: str) -> str:
+    try:
+        if backend == "claude-cli":
+            assistant_text = _run_claude_cli(sender_hash, user_message)
+        elif backend == "anthropic":
+            assistant_text = _call_anthropic(sender_hash, user_message)
+        else:
+            assistant_text = _call_openai(sender_hash, user_message)
+
+        if len(assistant_text) > MAX_RESPONSE_CHARS:
+            assistant_text = assistant_text[:MAX_RESPONSE_CHARS - 3] + "..."
+
+        return assistant_text
+
+    except subprocess.TimeoutExpired:
+        RNS.log("Claude CLI timed out", RNS.LOG_ERROR)
+        return "[Bot error: Response timed out. Try again.]"
+    except Exception as e:
+        error_msg = f"Error calling LLM ({backend}): {type(e).__name__}: {e}"
+        RNS.log(error_msg, RNS.LOG_ERROR)
+        return f"[Bot error: {type(e).__name__}. Try again later.]"
+
+
+def _get_history(sender_hash: str) -> list[dict]:
     with conversations_lock:
         if sender_hash not in conversations:
             conversations[sender_hash] = []
-        history = conversations[sender_hash]
+        return conversations[sender_hash]
 
+
+def _call_anthropic(sender_hash: str, user_message: str) -> str:
+    history = _get_history(sender_hash)
+    history.append({"role": "user", "content": user_message})
+
+    if len(history) > MAX_HISTORY * 2:
+        history[:] = history[-(MAX_HISTORY * 2):]
+
+    try:
+        response = llm_client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=history,
+        )
+        text = response.content[0].text
+        history.append({"role": "assistant", "content": text})
+        return text
+    except Exception:
+        history.pop()
+        raise
+
+
+def _call_openai(sender_hash: str, user_message: str) -> str:
+    history = _get_history(sender_hash)
     history.append({"role": "user", "content": user_message})
 
     if len(history) > MAX_HISTORY * 2:
         history[:] = history[-(MAX_HISTORY * 2):]
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-
     try:
         response = llm_client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=messages,
             max_tokens=1024,
         )
-        assistant_text = response.choices[0].message.content
-
-        if len(assistant_text) > MAX_RESPONSE_CHARS:
-            assistant_text = assistant_text[:MAX_RESPONSE_CHARS - 3] + "..."
-
-        history.append({"role": "assistant", "content": assistant_text})
-        return assistant_text
-
-    except Exception as e:
+        text = response.choices[0].message.content
+        history.append({"role": "assistant", "content": text})
+        return text
+    except Exception:
         history.pop()
-        error_msg = f"Error calling LLM: {type(e).__name__}: {e}"
-        RNS.log(error_msg, RNS.LOG_ERROR)
-        return f"[Bot error: {type(e).__name__}. Try again later.]"
+        raise
 
 
 def send_response(destination_hash: bytes, response_text: str):
@@ -146,9 +251,25 @@ def shutdown_handler(signum, frame):
 
 
 def main():
-    global llm_client, lxm_router, delivery_destination
+    global llm_client, backend, model, lxm_router, delivery_destination
 
-    llm_client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    # Auto-detect backend: prefer Claude CLI, then Anthropic API, then OpenAI/Ollama
+    if shutil.which("claude"):
+        backend = "claude-cli"
+        model = CLI_MODEL
+    elif os.environ.get("ANTHROPIC_API_KEY") and anthropic is not None:
+        backend = "anthropic"
+        model = ANTHROPIC_MODEL
+        llm_client = anthropic.Anthropic()
+    elif OpenAI is not None:
+        backend = "openai"
+        model = OLLAMA_MODEL
+        llm_client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    else:
+        print("ERROR: No LLM backend available.")
+        print("  Install Claude Code CLI, set ANTHROPIC_API_KEY,")
+        print("  or install the 'openai' package for Ollama support.")
+        sys.exit(1)
 
     reticulum = RNS.Reticulum()
     identity = get_or_create_identity()
@@ -174,8 +295,10 @@ def main():
     print("=" * 60)
     print(f"  LXMF address: {bot_hash}")
     print(f"  Identity:     {IDENTITY_PATH}")
-    print(f"  Model:        {MODEL}")
-    print(f"  Ollama:       {OLLAMA_BASE_URL}")
+    print(f"  Backend:      {backend}")
+    print(f"  Model:        {model}")
+    if backend == "openai":
+        print(f"  Ollama:       {OLLAMA_BASE_URL}")
     print()
     print("  Add this address in Sideband to start chatting.")
     print("  Press Ctrl+C to stop.")
